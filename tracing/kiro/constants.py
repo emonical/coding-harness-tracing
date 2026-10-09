@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from core.constants import LOG_DIR
+
 HARNESS_NAME = "kiro"
 DISPLAY_NAME = "Kiro"
 
@@ -22,8 +24,9 @@ KIRO_SESSIONS_DIR = Path.home() / ".kiro" / "sessions" / "cli"
 # Default agent name when the user doesn't specify one during install.
 DEFAULT_AGENT_NAME = "arize-traced"
 
-# Hook stderr goes here unless ARIZE_LOG_FILE is set.
-DEFAULT_LOG_FILE = Path.home() / ".arize" / "harness" / "logs" / "kiro.log"
+# Hook stderr goes here unless ARIZE_LOG_FILE is set. Derived from the shared
+# LOG_DIR so it follows ARIZE_HARNESS_HOME like every other harness log.
+DEFAULT_LOG_FILE = LOG_DIR / "kiro.log"
 
 # Single hook binary; the handler dispatches by hook_event_name.
 HOOK_BIN_NAME = "arize-hook-kiro"

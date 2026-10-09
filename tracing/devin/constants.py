@@ -6,6 +6,8 @@ import os
 import platform
 from pathlib import Path
 
+from core.constants import LOG_DIR
+
 HARNESS_NAME = "devin"
 DISPLAY_NAME = "Devin"
 
@@ -78,4 +80,5 @@ HOOK_BIN_NAME = "arize-hook-devin"
 # flush for an interrupted last turn. Both dispatch to the same hook binary.
 HOOK_EVENTS = ("Stop", "SessionEnd")
 
-DEFAULT_LOG_FILE = Path.home() / ".arize" / "harness" / "logs" / "devin.log"
+# Derived from the shared LOG_DIR so it follows ARIZE_HARNESS_HOME like every other harness log.
+DEFAULT_LOG_FILE = LOG_DIR / "devin.log"
