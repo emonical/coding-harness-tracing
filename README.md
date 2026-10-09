@@ -195,6 +195,37 @@ Most settings live in `.arize/harness/config.json`, but a small set of env vars 
 
 > Claude Code plugin reads env vars from `~/.claude/settings.json` under the `env` block
 
+### Workspace profiles
+
+One machine can send different workspaces to different backends. A `profiles` block in `config.json` names each backend, and a resolver command maps the working directory of a hook run to one of those names. `arize-harness hook` applies the chosen profile before the handler loads, so the handlers themselves are unchanged.
+
+```json
+{
+  "profiles": {
+    "resolver": "/usr/local/bin/resolve-workspace",
+    "by_name": {
+      "team-a": {
+        "harness_home": "~/stores/team-a/harness",
+        "target": "phoenix",
+        "endpoint": "http://127.0.0.1:6007",
+        "api_key_file": "~/stores/team-a/phoenix/writer.key",
+        "project_name": "claude-code",
+        "logging": {"prompts": true, "tool_details": true, "tool_content": false},
+        "attributes": {"workspace": "team-a"}
+      }
+    }
+  }
+}
+```
+
+- The resolver is run as `<resolver> <cwd>` (a string, or a list for an interpreter plus script) and prints one name. A name with no entry under `by_name` means the run is not traced.
+- Each profile may set `harness_home` (becomes `ARIZE_HARNESS_HOME`, so state and logs land in that tree), the backend (`target`, `endpoint`, `space_id`, `api_key_file` or `api_key`), `project_name`, `user_id`, the three `logging` flags, and `attributes` appended to `OTEL_RESOURCE_ATTRIBUTES`.
+- The decision is cached per `session_id` under `<root>/run/profiles/<harness>/`, so the resolver runs once per session and a session keeps its profile if its directory moves. The cache entry is removed at session end.
+- `ARIZE_PROFILE=<name>` in the environment picks a profile without running the resolver.
+- **Fail closed by default.** With a `profiles` block present, a resolver error, an unknown name or an unreadable key file skips the handler and writes one line to `<root>/logs/profiles.log`. Nothing falls through to a default backend unless you name one: `"fallback": "<name>"` traces unresolved runs under that profile (never a run whose key file cannot be read). Without the block, nothing here runs and the usual environment and `config.json` routing applies.
+
+`arize-harness profile [<cwd>]` prints the decision for a directory, with no secret values, which is the first thing to run when a workspace produces no spans.
+
 ## Links
 
 - [Arize AX](https://arize.com)
