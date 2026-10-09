@@ -5,6 +5,7 @@ Every module that needs a path imports it from here. Tests monkeypatch these
 values via the tmp_harness_dir fixture to avoid touching the real filesystem.
 """
 
+import os
 from pathlib import Path
 from typing import TypedDict
 
@@ -17,8 +18,23 @@ class HarnessMetadata(TypedDict):
     default_log_file: Path
 
 
+def _base_dir() -> Path:
+    """The harness runtime root: ``$ARIZE_HARNESS_HOME`` when set, else ``~/.arize/harness``.
+
+    ``ARIZE_HARNESS_HOME`` relocates everything derived from BASE_DIR: config.json,
+    per-harness state, logs and the run directory. It is read once, at import, so a
+    launcher that wants a separate root must export it before any ``core`` module
+    loads. It does not move the install tree (``core.setup.INSTALL_DIR``), which is
+    where the code lives, not where a session writes.
+    """
+    override = os.environ.get("ARIZE_HARNESS_HOME", "").strip()
+    if override:
+        return Path(os.path.expanduser(override))
+    return Path.home() / ".arize" / "harness"
+
+
 # --- Base layout ---
-BASE_DIR = Path.home() / ".arize" / "harness"
+BASE_DIR = _base_dir()
 CONFIG_FILE = BASE_DIR / "config.json"
 CONFIG_FILE_YAML = BASE_DIR / "config.yaml"
 
