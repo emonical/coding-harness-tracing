@@ -3,23 +3,30 @@
 Usage:
     arize-harness hook <harness> [<event>] [args...]
     arize-harness hook --list
+    arize-harness profile [<cwd>]
 
 ``hook`` runs the same handler as the matching ``arize-hook-*`` command, with
-stdin and any remaining arguments passed through untouched. It is invoked on
-every hook event, so it must start fast: keep this module's imports to the
-standard library, and import anything heavier (``core.setup``, which pulls in
-``python-dotenv``) inside the subcommand that needs it.
+stdin and any remaining arguments passed through untouched. When ``config.json``
+has a ``profiles`` block (see ``core.profiles``), the working directory of the
+run picks the backend first, and a run that resolves to no profile exits 0
+without loading a handler. ``profile`` prints that decision for a directory.
+
+It is invoked on every hook event, so it must start fast: keep this module's
+imports to the standard library, and import anything heavier (``core.setup``,
+which pulls in ``python-dotenv``) inside the subcommand that needs it.
 """
 
 import importlib
+import io
 import os
 import sys
 from pathlib import Path
 from typing import Any, List, Optional, TextIO
 
 from core.hook_table import ALIASES, EVENT_HOOKS, SINGLE_HOOKS, canonical_harness, iter_hooks, legacy_entry_point
+from core.profiles import apply_profile, describe, load_profiles, resolve
 
-_USAGE = "usage: arize-harness hook <harness> [<event>] [args...] | arize-harness hook --list"
+_USAGE = "usage: arize-harness hook <harness> [<event>] [args...] | arize-harness hook --list | arize-harness profile [<cwd>]"
 
 
 def _stderr() -> TextIO:
@@ -103,6 +110,14 @@ def _hook(args: List[str]) -> Any:
         _warn(f"unknown harness '{args[0]}' (see arize-harness hook --list)")
         return 0
 
+    # Pick the backend for this run before the handler module loads: the handler's
+    # paths and credentials are fixed at its import time from the environment.
+    decision = apply_profile(harness, event, rest)
+    if not decision.proceed:
+        return 0
+    if decision.stdin is not None:
+        sys.stdin = io.TextIOWrapper(io.BytesIO(decision.stdin), encoding="utf-8")
+
     module_name, _, function_name = target.partition(":")
     try:
         handler = getattr(importlib.import_module(module_name), function_name)
@@ -117,10 +132,35 @@ def _hook(args: List[str]) -> Any:
     return handler()
 
 
+def _profile(args: List[str]) -> int:
+    """Print how a run from ``cwd`` (default: the current directory) would be routed."""
+    if len(args) > 1:
+        _warn(_USAGE)
+        return 0
+    cwd = os.path.abspath(args[0]) if args else os.getcwd()
+    block = load_profiles()
+    if block is None:
+        print("no profiles configured: every run uses the shared config.json and environment")
+        return 0
+    forced = os.environ.get("ARIZE_PROFILE", "").strip()
+    if forced:
+        profile = block["by_name"].get(forced)
+        lines = describe(
+            forced, profile if isinstance(profile, dict) else None, f"ARIZE_PROFILE names no profile {forced!r}", cwd
+        )
+    else:
+        res = resolve(block, cwd)
+        lines = describe(res.name, res.profile, res.reason, cwd)
+    print("\n".join(lines))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> Any:
     args = sys.argv[1:] if argv is None else argv
     if args and args[0] == "hook":
         return _hook(args[1:])
+    if args and args[0] == "profile":
+        return _profile(args[1:])
     # Exit 0, not the conventional 2: Claude Code treats a hook's exit 2 as a
     # blocking error, so a mistyped hook command would block every tool call.
     _warn(_USAGE)
