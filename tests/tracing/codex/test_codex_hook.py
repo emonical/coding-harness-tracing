@@ -429,6 +429,245 @@ class TestExtractTurnFromRollout:
         assert tc["output"] == "file1\nfile2"
         assert tc["end_ts"] > tc["start_ts"]
 
+    def test_native_mcp_completion_preserves_structured_fields_and_failure(self, tmp_path):
+        path = _write_rollout(
+            tmp_path,
+            "s1",
+            _evt({"type": "task_started", "turn_id": "t1"}),
+            {
+                "timestamp": "2026-05-20T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "id": "mcp-1",
+                        "server": "example_server",
+                        "tool": "lookup",
+                        "arguments": {"query": "example"},
+                        "result": {"isError": True, "content": [{"type": "text", "text": "not found"}]},
+                        "status": "failed",
+                        "error": {"message": "not found"},
+                    },
+                    "started_at_ms": 1000,
+                    "completed_at_ms": 2000,
+                },
+            },
+            _evt({"type": "task_complete", "turn_id": "t1"}),
+        )
+
+        turn = _extract_turn_from_rollout(path, "t1")
+
+        assert turn["tool_calls"] == [
+            {
+                "tool": "lookup",
+                "args": {"query": "example"},
+                "output": {"content": [{"type": "text", "text": "not found"}]},
+                "call_id": "mcp-1",
+                "start_ts": 1000,
+                "end_ts": 2000,
+                "decision": None,
+                "source": "native",
+                "mcp_server": "example_server",
+                "span_name": "example_server.lookup",
+                "status": "failed",
+                "error": "not found",
+                "result_is_error": True,
+            }
+        ]
+
+    def test_native_command_and_web_search_completions(self, tmp_path):
+        path = _write_rollout(
+            tmp_path,
+            "s1",
+            _evt({"type": "task_started", "turn_id": "t1"}),
+            {
+                "timestamp": "2026-05-20T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "command-1",
+                        "command": ["/bin/sh", "-lc", "false"],
+                        "cwd": "file:///workspace",
+                        "parsed_cmd": [{"type": "unknown", "cmd": "false"}],
+                        "source": "exec",
+                        "status": "completed",
+                        "stdout": "",
+                        "stderr": "failed\n",
+                        "aggregated_output": "failed\n",
+                        "exit_code": 1,
+                    },
+                    "started_at_ms": 1000,
+                    "completed_at_ms": 2000,
+                },
+            },
+            {
+                "timestamp": "2026-05-20T00:00:03.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "WebSearch",
+                        "id": "search-1",
+                        "query": "example query",
+                        "action": {"type": "search", "query": "example query"},
+                        "status": "completed",
+                    },
+                    "started_at_ms": 2100,
+                    "completed_at_ms": 3000,
+                },
+            },
+            _evt({"type": "task_complete", "turn_id": "t1"}),
+        )
+
+        turn = _extract_turn_from_rollout(path, "t1")
+
+        assert turn["tool_calls"][0]["tool"] == "command_execution"
+        assert turn["tool_calls"][0]["args"] == {
+            "argv": ["/bin/sh", "-lc", "false"],
+            "cwd": "file:///workspace",
+            "parsed_cmd": [{"type": "unknown", "cmd": "false"}],
+            "source": "exec",
+        }
+        assert turn["tool_calls"][0]["output"]["exit_code"] == 1
+        assert turn["tool_calls"][1]["tool"] == "web_search"
+        assert turn["tool_calls"][1]["args"] == {"query": "example query"}
+
+    def test_native_mcp_completion_derives_start_time_from_duration(self, tmp_path):
+        path = _write_rollout(
+            tmp_path,
+            "s1",
+            _evt({"type": "task_started", "turn_id": "t1"}),
+            {
+                "timestamp": "2026-05-20T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "id": "mcp-1",
+                        "server": "example_server",
+                        "tool": "lookup",
+                        "duration": {"secs": 1, "nanos": 250_000_000},
+                    },
+                    "completed_at_ms": 2_000,
+                },
+            },
+            _evt({"type": "task_complete", "turn_id": "t1"}),
+        )
+
+        turn = _extract_turn_from_rollout(path, "t1")
+
+        assert turn["tool_calls"][0]["start_ts"] == 750
+        assert turn["tool_calls"][0]["end_ts"] == 2_000
+
+    def test_tool_search_call_pairs_with_its_output(self, tmp_path):
+        path = _write_rollout(
+            tmp_path,
+            "s1",
+            _evt({"type": "task_started", "turn_id": "t1"}),
+            _resp(
+                {
+                    "type": "tool_search_call",
+                    "call_id": "search-1",
+                    "status": "completed",
+                    "arguments": {"query": "memory tools", "limit": 10},
+                }
+            ),
+            _resp(
+                {
+                    "type": "tool_search_output",
+                    "call_id": "search-1",
+                    "status": "completed",
+                    "tools": [{"type": "namespace", "name": "mcp__memory"}],
+                },
+                ts="2026-05-20T00:00:02.000Z",
+            ),
+            _evt({"type": "task_complete", "turn_id": "t1"}),
+        )
+
+        turn = _extract_turn_from_rollout(path, "t1")
+
+        assert turn["tool_calls"] == [
+            {
+                "tool": "tool_search",
+                "args": {"query": "memory tools", "limit": 10},
+                "output": {"tools": [{"type": "namespace", "name": "mcp__memory"}]},
+                "call_id": "search-1",
+                "start_ts": _iso_to_ms("2026-05-20T00:00:01.000Z"),
+                "end_ts": _iso_to_ms("2026-05-20T00:00:02.000Z"),
+                "decision": None,
+                "status": "completed",
+                "error": "",
+                "result_is_error": False,
+            }
+        ]
+
+    def test_native_web_search_replaces_matching_legacy_record(self, tmp_path):
+        path = _write_rollout(
+            tmp_path,
+            "s1",
+            _evt({"type": "task_started", "turn_id": "t1"}),
+            {
+                "timestamp": "2026-05-20T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "WebSearch",
+                        "id": "native-search-1",
+                        "query": "Phoenix tracing",
+                        "action": {"type": "search", "query": "Phoenix tracing"},
+                    },
+                    "completed_at_ms": 2_000,
+                },
+            },
+            _resp(
+                {
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "Phoenix tracing"},
+                },
+                ts="2026-05-20T00:00:02.000Z",
+            ),
+            _evt({"type": "task_complete", "turn_id": "t1"}),
+        )
+
+        turn = _extract_turn_from_rollout(path, "t1")
+
+        assert [entry["tool"] for entry in turn["tool_calls"]] == ["web_search"]
+        assert turn["tool_calls"][0]["call_id"] == "native-search-1"
+
+    def test_native_completion_replaces_matching_legacy_call(self, tmp_path):
+        path = _write_rollout(
+            tmp_path,
+            "s1",
+            _evt({"type": "task_started", "turn_id": "t1"}),
+            _resp({"type": "function_call", "name": "legacy_lookup", "arguments": "{}", "call_id": "mcp-1"}),
+            {
+                "timestamp": "2026-05-20T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "id": "mcp-1",
+                        "server": "example_server",
+                        "tool": "lookup",
+                        "arguments": {},
+                        "result": {"content": []},
+                    },
+                },
+            },
+            _evt({"type": "task_complete", "turn_id": "t1"}),
+        )
+
+        turn = _extract_turn_from_rollout(path, "t1")
+
+        assert [entry["tool"] for entry in turn["tool_calls"]] == ["lookup"]
+
     def test_spawn_agent_function_call_keeps_argument_string(self, tmp_path):
         """spawn_agent is a regular function_call: args stay the raw JSON
         string (including the nested model field), not parsed or rewritten."""
@@ -681,6 +920,44 @@ class TestBuildAndSendSpans:
         assert child_attrs["codex.workspace"]["stringValue"] == "workspace"
         assert child_attrs["input.value"]["stringValue"] == '{"cmd":"ls"}'
         assert child_attrs["output.value"]["stringValue"] == "ok"
+
+    def test_native_tool_serializes_structured_data_and_marks_failures(self):
+        turn = {
+            "trace_count": 1,
+            "turn_start_ms": 1000,
+            "turn_end_ms": 2000,
+            "user_prompt": "hi",
+            "assistant_output": "hello",
+            "tool_calls": [
+                {
+                    "tool": "lookup",
+                    "args": {"query": "example", "limit": 1},
+                    "output": {"content": [{"type": "text", "text": "not found"}]},
+                    "call_id": "mcp-1",
+                    "start_ts": 1100,
+                    "end_ts": 1200,
+                    "source": "native",
+                    "mcp_server": "example_server",
+                    "status": "failed",
+                    "error": "not found",
+                    "result_is_error": True,
+                }
+            ],
+        }
+        sent, patcher = self._send_capture()
+
+        with patcher:
+            _build_and_send_spans("sess-1", "turn-1", turn)
+
+        child = sent[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][1]
+        attrs = _attrs_of_span(child)
+        assert child["name"] == "example_server.lookup"
+        assert attrs["input.value"]["stringValue"] == '{"limit":1,"query":"example"}'
+        assert attrs["output.value"]["stringValue"] == '{"content":[{"text":"not found","type":"text"}]}'
+        assert attrs["codex.mcp.server"]["stringValue"] == "example_server"
+        assert attrs["codex.mcp.tool"]["stringValue"] == "lookup"
+        assert attrs["error.type"]["stringValue"] == "tool_error"
+        assert child["status"] == {"code": 2, "message": "not found"}
 
     def test_spawn_agent_becomes_one_tool_span(self):
         """A spawn_agent tool_calls entry is one TOOL child named spawn_agent,
