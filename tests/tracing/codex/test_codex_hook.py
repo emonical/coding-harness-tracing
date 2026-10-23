@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -849,6 +850,35 @@ class TestBuildAndSendSpans:
         parent_attrs = _attrs_of_span(sent[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0])
         assert parent_attrs["project.name"]["stringValue"] == "from-config"
 
+    def test_system_prompt_digest_is_always_recorded_but_text_is_opt_in(self, monkeypatch):
+        system_prompt = "Use the repository instructions."
+        turn = {
+            "trace_count": 1,
+            "turn_start_ms": 1000,
+            "turn_end_ms": 2000,
+            "user_prompt": "hi",
+            "assistant_output": "hello",
+            "system_prompt": system_prompt,
+        }
+        monkeypatch.setenv("ARIZE_LOG_SYSTEM_PROMPT", "false")
+        sent, patcher = self._send_capture()
+        with patcher:
+            _build_and_send_spans("sess-1", "turn-1", turn)
+        attrs = _attrs_of_span(sent[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0])
+        assert (
+            attrs["codex.system_prompt.sha256"]["stringValue"]
+            == hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+        )
+        assert attrs["codex.system_prompt.length"]["intValue"] == len(system_prompt)
+        assert "codex.system_prompt" not in attrs
+
+        monkeypatch.setenv("ARIZE_LOG_SYSTEM_PROMPT", "true")
+        sent, patcher = self._send_capture()
+        with patcher:
+            _build_and_send_spans("sess-1", "turn-1", turn)
+        attrs = _attrs_of_span(sent[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0])
+        assert attrs["codex.system_prompt"]["stringValue"] == system_prompt
+
     def test_multi_span_with_one_tool(self, monkeypatch):
         monkeypatch.setenv("ARIZE_PROJECT_NAME", "codex")
         turn = {
@@ -1156,6 +1186,23 @@ class TestBuildAndSendSpans:
         parent_attrs = _attrs_of_span(sent[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0])
         assert parent_attrs["llm.system"]["stringValue"] == "openai"
         assert "llm.provider" not in parent_attrs
+
+    def test_session_meta_base_instructions_become_system_prompt(self, tmp_path):
+        path = _write_rollout(
+            tmp_path,
+            "s1",
+            {
+                "timestamp": "2026-05-20T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"base_instructions": {"text": "Follow the repository rules."}},
+            },
+            _evt({"type": "task_started", "turn_id": "t1"}),
+            _evt({"type": "task_complete", "turn_id": "t1"}),
+        )
+
+        turn = _extract_turn_from_rollout(path, "t1")
+
+        assert turn["system_prompt"] == "Follow the repository rules."
 
     def test_input_message_omitted_entirely_when_prompt_empty(self):
         """No indexed message (neither role nor content) is written when the

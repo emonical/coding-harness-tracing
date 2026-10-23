@@ -12,6 +12,7 @@ plus all TOOL child spans.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -217,6 +218,7 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
     assistant_output = ""
     model = ""
     model_provider: "str | None" = None
+    system_prompt = ""
     cwd = ""
     permission_mode = ""
     sandbox_mode = ""
@@ -251,6 +253,11 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
                 # in_turn gate below.
                 if outer == "session_meta" and isinstance(payload, dict):
                     model_provider = payload.get("model_provider")
+                    base_instructions = payload.get("base_instructions") or {}
+                    if isinstance(base_instructions, dict):
+                        prompt = base_instructions.get("text")
+                        if isinstance(prompt, str):
+                            system_prompt = prompt
                     continue
 
                 # turn_context records carry per-turn settings (model, cwd, sandbox).
@@ -520,6 +527,7 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
         "assistant_output": assistant_output,
         "model": model,
         "model_provider": model_provider,
+        "system_prompt": system_prompt,
         "cwd": cwd,
         "permission_mode": permission_mode,
         "sandbox_mode": sandbox_mode,
@@ -604,6 +612,11 @@ def _tool_failure(entry: dict) -> "tuple[bool, str]":
     return failed, str(entry.get("error") or "tool execution failed")[:1024]
 
 
+def _log_system_prompt() -> bool:
+    """Keep full system-prompt capture independent from user-prompt capture."""
+    return os.environ.get("ARIZE_LOG_SYSTEM_PROMPT", "false").lower() == "true"
+
+
 def _build_and_send_spans(thread_id: str, turn_id: str, turn: dict) -> None:
     """Assemble the LLM + TOOL spans from an extracted turn and ship them."""
     project_name = env.project_name_for(SERVICE_NAME) or "codex"
@@ -643,6 +656,12 @@ def _build_and_send_spans(thread_id: str, turn_id: str, turn: dict) -> None:
         attrs["codex.sandbox_mode"] = turn["sandbox_mode"]
     if turn.get("duration_ms") is not None:
         attrs["codex.turn.duration_ms"] = turn["duration_ms"]
+    system_prompt = turn.get("system_prompt") or ""
+    if system_prompt:
+        attrs["codex.system_prompt.sha256"] = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+        attrs["codex.system_prompt.length"] = len(system_prompt)
+        if _log_system_prompt():
+            attrs["codex.system_prompt"] = system_prompt
 
     llm_system, llm_provider = _llm_identity(turn.get("model"), turn.get("model_provider"))
     attrs["llm.system"] = llm_system
