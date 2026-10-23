@@ -110,6 +110,7 @@ ARIZE_ENV_FILE=~/.arize/onboarding.env ./install.sh claude --non-interactive
 | `ARIZE_USER_ID` | — | Optional `user.id` on every span. Also an email source for the Arize AX project default when the entered install user ID is blank or is not an email address. |
 | `ARIZE_OTLP_ENDPOINT` | `otlp.arize.com:443` | Override for hosted/dedicated Arize instances. |
 | `ARIZE_LOG_PROMPTS` | `false` | Set `true` to capture prompt text. |
+| `ARIZE_LOG_SYSTEM_PROMPT` | `false` | Set `true` to capture Codex's persisted base-instruction text. The SHA-256 digest and length are always recorded when available. |
 | `ARIZE_LOG_TOOL_DETAILS` | `false` | Set `true` to capture tool commands, file paths and URLs. |
 | `ARIZE_LOG_TOOL_CONTENT` | `false` | Set `true` to capture tool output. |
 | `ARIZE_ENV_FILE` | — | Dotenv file to read. No file is read unless this is set. A path that is not a readable file is an error, not a fall-back to the environment. |

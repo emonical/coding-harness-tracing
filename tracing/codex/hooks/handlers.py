@@ -12,6 +12,7 @@ plus all TOOL child spans.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -103,6 +104,110 @@ def _iso_to_ms(ts: str) -> int:
         return 0
 
 
+def _native_tool_call(payload: dict, fallback_ts: int) -> "dict | None":
+    """Normalize a completed native tool call into the adapter's tool-event shape."""
+    item = payload.get("item") or {}
+    if not isinstance(item, dict):
+        return None
+
+    end_ts = payload.get("completed_at_ms") or fallback_ts
+    start_ts = payload.get("started_at_ms") or end_ts
+    duration = item.get("duration") or {}
+    if not payload.get("started_at_ms") and isinstance(duration, dict):
+        seconds = duration.get("secs")
+        nanoseconds = duration.get("nanos")
+        if isinstance(seconds, int) or isinstance(nanoseconds, int):
+            duration_ms = (seconds or 0) * 1000 + (nanoseconds or 0) // 1_000_000
+            start_ts = max(end_ts - duration_ms, 0)
+    item_type = item.get("type")
+    common = {
+        "call_id": item.get("id") or "",
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "decision": None,
+        "source": "native",
+        "status": item.get("status") or "",
+        "error": "",
+        "result_is_error": False,
+    }
+
+    if item_type == "CommandExecution":
+        return {
+            **common,
+            "tool": "command_execution",
+            "args": {
+                "argv": item.get("command") or [],
+                "cwd": item.get("cwd") or "",
+                "parsed_cmd": item.get("parsed_cmd") or [],
+                "source": item.get("source") or "",
+            },
+            "output": {
+                "stdout": item.get("stdout") or "",
+                "stderr": item.get("stderr") or "",
+                "aggregated_output": item.get("aggregated_output") or "",
+                "exit_code": item.get("exit_code"),
+            },
+            "command_exit_code": item.get("exit_code"),
+            "command_source": item.get("source") or "",
+        }
+
+    if item_type == "WebSearch":
+        action = item.get("action") or {}
+        action_type = action.get("type") if isinstance(action, dict) else ""
+        tool = action_type if action_type in ("open_page", "web_search") else "web_search"
+        if tool == "web_search":
+            args = {"query": item.get("query") or (action.get("query") if isinstance(action, dict) else "")}
+        else:
+            args = {"url": action.get("url") or ""}
+        return {**common, "tool": tool, "args": args, "output": item.get("result") or {}}
+
+    if item_type != "McpToolCall":
+        return None
+
+    result = item.get("result") or {}
+    output = {}
+    if isinstance(result, dict):
+        for key in ("content", "structuredContent"):
+            if key in result:
+                output[key] = result[key]
+
+    error = item.get("error") or {}
+    return {
+        **common,
+        "tool": item.get("tool") or "mcp_tool_call",
+        "span_name": f"{item.get('server') or 'mcp'}.{item.get('tool') or 'tool_call'}",
+        "args": item.get("arguments") or {},
+        "output": output,
+        "mcp_server": item.get("server") or "",
+        "error": error.get("message") if isinstance(error, dict) else str(error or ""),
+        "result_is_error": bool(result.get("isError")) if isinstance(result, dict) else False,
+    }
+
+
+def _native_user_message_text(payload: dict, turn_id: str) -> str:
+    """Extract text from a completed native UserMessage for the active turn."""
+    if payload.get("turn_id") != turn_id:
+        return ""
+    item = payload.get("item") or {}
+    if not isinstance(item, dict) or item.get("type") != "UserMessage":
+        return ""
+    content = item.get("content") or []
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        part["text"]
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+    )
+
+
+def _web_search_signature(tool_name: str, args: object) -> "tuple[str, str]":
+    """Create a stable identity for native and legacy web-search records."""
+    field = "url" if tool_name == "open_page" else "query"
+    value = args.get(field) if isinstance(args, dict) else args
+    return tool_name, str(value or "")
+
+
 def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None":
     """Walk the rollout JSONL and extract everything for one turn. Returns None if the
     turn isn't found."""
@@ -130,6 +235,7 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
     assistant_output = ""
     model = ""
     model_provider: "str | None" = None
+    system_prompt = ""
     cwd = ""
     permission_mode = ""
     sandbox_mode = ""
@@ -138,6 +244,9 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
     pending_func: dict = {}  # call_id -> entry being filled
     pending_custom: dict = {}  # call_id -> Code Mode entry being filled
     pending_search_end: "dict | None" = None  # most recent unmatched web_search_end
+    pending_tool_search: dict = {}  # call_id -> entry being filled
+    native_tool_ids: set = set()
+    native_web_searches: list = []
 
     try:
         with open(rollout_path, "r", encoding="utf-8") as f:
@@ -161,6 +270,11 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
                 # in_turn gate below.
                 if outer == "session_meta" and isinstance(payload, dict):
                     model_provider = payload.get("model_provider")
+                    base_instructions = payload.get("base_instructions") or {}
+                    if isinstance(base_instructions, dict):
+                        prompt = base_instructions.get("text")
+                        if isinstance(prompt, str):
+                            system_prompt = prompt
                     continue
 
                 # turn_context records carry per-turn settings (model, cwd, sandbox).
@@ -239,9 +353,42 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
                             observed_fields.add(k)
                     continue
 
+                # Native completion records are authoritative over legacy response
+                # items that share an ID. Normalize them before legacy parsing so
+                # both record orders are handled consistently.
+                if outer == "event_msg" and ptype == "item_completed":
+                    native_user_prompt = _native_user_message_text(payload, turn_id)
+                    if native_user_prompt:
+                        user_prompt = native_user_prompt
+                        continue
+                    native_entry = _native_tool_call(payload, ts_ms)
+                    if native_entry is not None:
+                        native_id = native_entry["call_id"]
+                        if native_id:
+                            native_tool_ids.add(native_id)
+                            tool_calls[:] = [entry for entry in tool_calls if entry.get("call_id") != native_id]
+                        if native_entry["tool"] in {"web_search", "open_page"}:
+                            signature = _web_search_signature(native_entry["tool"], native_entry["args"])
+                            matching_legacy = next(
+                                (
+                                    entry
+                                    for entry in tool_calls
+                                    if entry.get("legacy_web_search_signature") == signature
+                                ),
+                                None,
+                            )
+                            if matching_legacy is not None:
+                                tool_calls.remove(matching_legacy)
+                            else:
+                                native_web_searches.append(signature)
+                        tool_calls.append(native_entry)
+                    continue
+
                 # Shell / apply_patch tool call
                 if outer == "response_item" and ptype == "function_call":
                     call_id = payload.get("call_id") or ""
+                    if call_id and call_id in native_tool_ids:
+                        continue
                     entry = {
                         "tool": payload.get("name") or "function_call",
                         "args": payload.get("arguments") or "",
@@ -261,6 +408,34 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
                     pending = pending_func.get(call_id) if call_id else None
                     if pending is not None:
                         pending["output"] = payload.get("output") or ""
+                        pending["end_ts"] = ts_ms or pending["end_ts"]
+                    continue
+
+                if outer == "response_item" and ptype == "tool_search_call":
+                    call_id = payload.get("call_id") or ""
+                    entry = {
+                        "tool": "tool_search",
+                        "args": payload.get("arguments") or {},
+                        "output": "",
+                        "call_id": call_id,
+                        "start_ts": ts_ms,
+                        "end_ts": ts_ms,
+                        "decision": None,
+                        "status": payload.get("status") or "",
+                        "error": "",
+                        "result_is_error": False,
+                    }
+                    tool_calls.append(entry)
+                    if call_id:
+                        pending_tool_search[call_id] = entry
+                    continue
+
+                if outer == "response_item" and ptype == "tool_search_output":
+                    call_id = payload.get("call_id") or ""
+                    pending = pending_tool_search.get(call_id) if call_id else None
+                    if pending is not None:
+                        pending["output"] = {"tools": payload.get("tools") or []}
+                        pending["status"] = payload.get("status") or pending["status"]
                         pending["end_ts"] = ts_ms or pending["end_ts"]
                     continue
 
@@ -315,6 +490,10 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
                         call_id = pending_search_end["call_id"]
                         start_ts = pending_search_end["ts_ms"] or start_ts
                         pending_search_end = None
+                    signature = _web_search_signature(tool_name, args)
+                    if signature in native_web_searches:
+                        native_web_searches.remove(signature)
+                        continue
                     tool_calls.append(
                         {
                             "tool": tool_name,
@@ -324,6 +503,7 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
                             "start_ts": start_ts,
                             "end_ts": ts_ms,
                             "decision": None,
+                            "legacy_web_search_signature": signature,
                         }
                     )
                     continue
@@ -368,6 +548,7 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
         "assistant_output": assistant_output,
         "model": model,
         "model_provider": model_provider,
+        "system_prompt": system_prompt,
         "cwd": cwd,
         "permission_mode": permission_mode,
         "sandbox_mode": sandbox_mode,
@@ -435,6 +616,28 @@ def _put_indexed_message(attrs: dict, prefix: str, role: str, content: str) -> N
     attrs[f"{prefix}.0.message.content"] = content
 
 
+def _tool_value(value: object) -> str:
+    """Serialize structured tool data deterministically before redaction."""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return str(value or "")
+
+
+def _tool_failure(entry: dict) -> "tuple[bool, str]":
+    """Return whether a normalized tool event represents a failed operation."""
+    status = str(entry.get("status") or "").lower()
+    failed = bool(entry.get("result_is_error") or entry.get("error"))
+    failed = failed or status in {"failed", "error", "cancelled", "canceled"}
+    exit_code = entry.get("command_exit_code")
+    failed = failed or (isinstance(exit_code, int) and exit_code != 0)
+    return failed, str(entry.get("error") or "tool execution failed")[:1024]
+
+
+def _log_system_prompt() -> bool:
+    """Keep full system-prompt capture independent from user-prompt capture."""
+    return os.environ.get("ARIZE_LOG_SYSTEM_PROMPT", "false").lower() == "true"
+
+
 def _build_and_send_spans(thread_id: str, turn_id: str, turn: dict) -> None:
     """Assemble the LLM + TOOL spans from an extracted turn and ship them."""
     project_name = env.project_name_for(SERVICE_NAME) or "codex"
@@ -474,6 +677,12 @@ def _build_and_send_spans(thread_id: str, turn_id: str, turn: dict) -> None:
         attrs["codex.sandbox_mode"] = turn["sandbox_mode"]
     if turn.get("duration_ms") is not None:
         attrs["codex.turn.duration_ms"] = turn["duration_ms"]
+    system_prompt = turn.get("system_prompt") or ""
+    if system_prompt:
+        attrs["codex.system_prompt.sha256"] = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+        attrs["codex.system_prompt.length"] = len(system_prompt)
+        if _log_system_prompt():
+            attrs["codex.system_prompt"] = system_prompt
 
     llm_system, llm_provider = _llm_identity(turn.get("model"), turn.get("model_provider"))
     attrs["llm.system"] = llm_system
@@ -507,8 +716,8 @@ def _build_and_send_spans(thread_id: str, turn_id: str, turn: dict) -> None:
     child_spans: list = []
     for entry in turn.get("tool_calls") or []:
         tool_name = entry.get("tool") or "unknown_tool"
-        args_raw = entry.get("args") or ""
-        output_raw = entry.get("output") or ""
+        args_raw = _tool_value(entry.get("args"))
+        output_raw = _tool_value(entry.get("output"))
         tool_attrs: dict = {
             "openinference.span.kind": "TOOL",
             "tool.name": tool_name,
@@ -523,10 +732,23 @@ def _build_and_send_spans(thread_id: str, turn_id: str, turn: dict) -> None:
         if entry.get("call_id"):
             tool_attrs["tool.id"] = entry["call_id"]
             tool_attrs["codex.tool.call_id"] = entry["call_id"]
+        if entry.get("mcp_server"):
+            tool_attrs["codex.mcp.server"] = entry["mcp_server"]
+            tool_attrs["codex.mcp.tool"] = tool_name
+        if entry.get("command_exit_code") is not None:
+            tool_attrs["codex.command.exit_code"] = entry["command_exit_code"]
+        if entry.get("command_source"):
+            tool_attrs["codex.command.source"] = entry["command_source"]
+        failed, error_message = _tool_failure(entry)
+        if failed:
+            tool_attrs["error.type"] = "tool_error"
         child_start = entry.get("start_ts") or turn["turn_start_ms"]
         child_end = entry.get("end_ts") or child_start
+        span_name = entry.get("span_name") or (
+            f"{entry['mcp_server']}.{tool_name}" if entry.get("mcp_server") else tool_name
+        )
         child = build_span(
-            tool_name,
+            span_name,
             "TOOL",
             generate_span_id(),
             trace_id,
@@ -536,6 +758,8 @@ def _build_and_send_spans(thread_id: str, turn_id: str, turn: dict) -> None:
             tool_attrs,
             SERVICE_NAME,
             SCOPE_NAME,
+            2 if failed else 1,
+            error_message if failed else "",
         )
         child_spans.append(child)
 
