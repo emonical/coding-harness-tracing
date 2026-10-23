@@ -160,6 +160,70 @@ class TestExtractTurnFromRollout:
         assert turn["turn_end_ms"] == 1010 * 1000
         assert turn["duration_ms"] == 10000
 
+    def test_extracts_native_user_message_for_active_turn(self, tmp_path):
+        path = _write_rollout(
+            tmp_path,
+            "s1",
+            _evt({"type": "task_started", "turn_id": "t1"}),
+            _evt(
+                {
+                    "type": "item_completed",
+                    "turn_id": "other-turn",
+                    "item": {"type": "UserMessage", "content": [{"type": "text", "text": "ignore me"}]},
+                }
+            ),
+            _evt(
+                {
+                    "type": "item_completed",
+                    "turn_id": "t1",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [
+                            {"type": "text", "text": "native "},
+                            {"type": "image", "url": "https://example.test/image.png"},
+                            {"type": "text", "text": "prompt"},
+                        ],
+                    },
+                }
+            ),
+            _evt({"type": "task_complete", "turn_id": "t1"}),
+        )
+
+        turn = _extract_turn_from_rollout(path, "t1")
+
+        assert turn["user_prompt"] == "native prompt"
+
+    def test_native_user_message_respects_prompt_redaction(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+        path = _write_rollout(
+            tmp_path,
+            "s1",
+            _evt({"type": "task_started", "turn_id": "t1"}),
+            _evt(
+                {
+                    "type": "item_completed",
+                    "turn_id": "t1",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "text", "text": "secret native prompt"}],
+                    },
+                }
+            ),
+            _evt({"type": "task_complete", "turn_id": "t1"}),
+        )
+        turn = _extract_turn_from_rollout(path, "t1")
+        sent = []
+
+        with mock.patch(
+            "tracing.codex.hooks.handlers.send_span_to_backend",
+            side_effect=lambda payload: (sent.append(payload), True)[1],
+        ):
+            _build_and_send_spans("s1", "t1", turn)
+
+        attrs = _attrs_of_span(sent[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0])
+        assert attrs["input.value"]["stringValue"] == "<redacted (20 chars)>"
+        assert attrs["llm.input_messages.0.message.content"]["stringValue"] == "<redacted (20 chars)>"
+
     def test_task_complete_overrides_intermediate_agent_message(self, tmp_path):
         path = _write_rollout(
             tmp_path,

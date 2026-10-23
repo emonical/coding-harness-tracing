@@ -184,6 +184,23 @@ def _native_tool_call(payload: dict, fallback_ts: int) -> "dict | None":
     }
 
 
+def _native_user_message_text(payload: dict, turn_id: str) -> str:
+    """Extract text from a completed native UserMessage for the active turn."""
+    if payload.get("turn_id") != turn_id:
+        return ""
+    item = payload.get("item") or {}
+    if not isinstance(item, dict) or item.get("type") != "UserMessage":
+        return ""
+    content = item.get("content") or []
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        part["text"]
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+    )
+
+
 def _web_search_signature(tool_name: str, args: object) -> "tuple[str, str]":
     """Create a stable identity for native and legacy web-search records."""
     field = "url" if tool_name == "open_page" else "query"
@@ -340,6 +357,10 @@ def _extract_turn_from_rollout(rollout_path: Path, turn_id: str) -> "dict | None
                 # items that share an ID. Normalize them before legacy parsing so
                 # both record orders are handled consistently.
                 if outer == "event_msg" and ptype == "item_completed":
+                    native_user_prompt = _native_user_message_text(payload, turn_id)
+                    if native_user_prompt:
+                        user_prompt = native_user_prompt
+                        continue
                     native_entry = _native_tool_call(payload, ts_ms)
                     if native_entry is not None:
                         native_id = native_entry["call_id"]
